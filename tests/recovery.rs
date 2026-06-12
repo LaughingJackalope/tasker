@@ -1,6 +1,5 @@
 use tempfile::TempDir;
 
-use tasker::engine::TaskEngine;
 use tasker::journal::{self, JournalRecord, JournalWriter};
 use tasker::snapshot::{read_snapshot, write_snapshot};
 use tasker::types::*;
