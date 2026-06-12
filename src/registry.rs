@@ -1,30 +1,22 @@
 use dashmap::DashMap;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
-
-use tokio::net::{TcpStream, UnixStream};
+use tokio::sync::Mutex;
 
 use crate::protocol::ProtocolError;
-
-/// Transport connection to a component instance.
-pub enum Transport {
-    Unix(UnixStream),
-    Tcp(TcpStream),
-}
 
 /// A registered component instance.
 pub struct InstanceConnection {
     pub component_id: String,
-    pub transport: tokio::sync::Mutex<Transport>,
     pub last_heartbeat: AtomicU64,
 }
 
 impl InstanceConnection {
-    pub fn new(component_id: String, transport: Transport) -> Self {
+    pub fn new(component_id: String) -> Self {
         Self {
             component_id,
-            transport: tokio::sync::Mutex::new(transport),
             last_heartbeat: AtomicU64::new(now_millis()),
         }
     }
@@ -37,24 +29,8 @@ impl InstanceConnection {
         let elapsed = now_millis() - self.last_heartbeat.load(Ordering::Relaxed);
         elapsed < timeout_secs * 1000
     }
-
-    /// Send a frame over this instance's transport.
-    pub async fn send_frame(&self, frame: &[u8]) -> Result<(), ProtocolError> {
-        use tokio::io::AsyncWriteExt;
-        let mut transport = self.transport.lock().await;
-        match &mut *transport {
-            Transport::Unix(stream) => {
-                stream.write_all(frame).await?;
-                stream.flush().await?;
-            }
-            Transport::Tcp(stream) => {
-                stream.write_all(frame).await?;
-                stream.flush().await?;
-            }
-        }
-        Ok(())
-    }
 }
+
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -63,10 +39,15 @@ fn now_millis() -> u64 {
         .min(u64::MAX as u128) as u64
 }
 
+/// Shared stream wrapper for registered instances.
+pub type SharedStream = Arc<Mutex<tokio::net::UnixStream>>;
+
 /// Concurrent registry of component instances, keyed by component_id.
 pub struct InstanceRegistry {
     instances: DashMap<String, Arc<InstanceConnection>>,
     timeout_secs: u64,
+    /// Shared streams of connected instances, keyed by component_id.
+    pub streams: Arc<Mutex<HashMap<String, SharedStream>>>,
 }
 
 impl InstanceRegistry {
@@ -74,16 +55,13 @@ impl InstanceRegistry {
         Arc::new(Self {
             instances: DashMap::new(),
             timeout_secs,
+            streams: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
     /// Register a component instance.
-    pub fn register(
-        &self,
-        component_id: String,
-        transport: Transport,
-    ) -> Result<(), ProtocolError> {
-        let conn = Arc::new(InstanceConnection::new(component_id.clone(), transport));
+    pub fn register(&self, component_id: String) -> Result<(), ProtocolError> {
+        let conn = Arc::new(InstanceConnection::new(component_id.clone()));
         self.instances.insert(component_id, conn);
         Ok(())
     }
@@ -95,7 +73,9 @@ impl InstanceRegistry {
 
     /// Get a connection by component_id.
     pub fn get(&self, component_id: &str) -> Option<Arc<InstanceConnection>> {
-        self.instances.get(component_id).map(|c| Arc::clone(&c))
+        self.instances
+            .get(component_id)
+            .map(|c| Arc::clone(&c))
     }
 
     /// Check if a component instance is registered and healthy.
@@ -114,6 +94,7 @@ impl InstanceRegistry {
     /// Remove stale instances that haven't heartbeated within the timeout.
     pub fn evict_stale(&self) {
         let timeout = self.timeout_secs;
-        self.instances.retain(|_, conn| conn.is_healthy(timeout));
+        self.instances
+            .retain(|_, conn| conn.is_healthy(timeout));
     }
 }

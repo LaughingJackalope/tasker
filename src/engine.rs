@@ -185,7 +185,7 @@ pub struct TaskEngine {
     /// Append-only journal for durability.
     journal: Arc<tokio::sync::Mutex<JournalWriter>>,
     /// Instance registry for multi-component dispatch.
-    registry: Arc<InstanceRegistry>,
+    pub registry: Arc<InstanceRegistry>,
 }
 
 impl TaskEngine {
@@ -821,8 +821,8 @@ impl TaskEngine {
             });
         }
         let component_id = &task.spec.component_id;
-        let conn = self
-            .registry
+        // Verify the instance is registered
+        self.registry
             .get(component_id)
             .ok_or_else(|| EngineError::NoInstance(component_id.clone()))?;
 
@@ -830,9 +830,22 @@ impl TaskEngine {
         let payload =
             rmp_serde::to_vec(&task.spec).map_err(|e| EngineError::Internal(e.to_string()))?;
         let frame = protocol::encode_frame(MsgType::Dispatch, 0, &payload);
-        conn.send_frame(&frame)
-            .await
-            .map_err(|e| EngineError::TransportError(e.to_string()))?;
+
+        // Send to the instance's shared stream
+        let streams = self.registry.streams.lock().await;
+        let shared = streams
+            .get(component_id)
+            .ok_or_else(|| EngineError::TransportError("stream not available".into()))?
+            .clone();
+        drop(streams);
+        use tokio::io::AsyncWriteExt;
+        let mut stream = shared.lock().await;
+        stream.write_all(&frame).await.map_err(|e| {
+            EngineError::TransportError(format!("write error: {}", e))
+        })?;
+        stream.flush().await.map_err(|e| {
+            EngineError::TransportError(format!("flush error: {}", e))
+        })?;
 
         Ok(())
     }

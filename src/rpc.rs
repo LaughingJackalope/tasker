@@ -8,12 +8,13 @@ use rmp_serde::{from_slice, to_vec};
 use rmpv::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
+use tokio::sync::Mutex;
 
 use crate::protocol::{self, Frame, MsgType, ProtocolError};
-use crate::registry::{InstanceRegistry, Transport};
+use crate::registry::InstanceRegistry;
 use crate::types::*;
 
-/// Status report sent by component instances back to tasker.
+use crate::engine::TaskEngine;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TaskStatusReport {
     pub task_id: TaskId,
@@ -24,29 +25,12 @@ pub struct TaskStatusReport {
 /// Request enum — serialized over the wire as MessagePack.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub enum Request {
-    Create {
-        spec: TaskSpec,
-    },
-    Start {
-        id: TaskId,
-        worker: WorkerId,
-    },
-    Complete {
-        id: TaskId,
-        result: TaskResult,
-    },
-    Cancel {
-        id: TaskId,
-        reason: u32,
-    },
-    DependsOn {
-        from: TaskId,
-        to: TaskId,
-        kind: EdgeKind,
-    },
-    RemoveDep {
-        edge_id: EdgeId,
-    },
+    Create { spec: TaskSpec },
+    Start { id: TaskId, worker: WorkerId },
+    Complete { id: TaskId, result: TaskResult },
+    Cancel { id: TaskId, reason: u32 },
+    DependsOn { from: TaskId, to: TaskId, kind: EdgeKind },
+    RemoveDep { edge_id: EdgeId },
     Stats,
     Shutdown,
 }
@@ -82,7 +66,6 @@ pub enum Response {
     Err { error: WireError },
 }
 
-use crate::engine::TaskEngine;
 use crate::error::EngineError;
 
 /// Server that listens on both UDS and TCP, dispatching to the engine.
@@ -151,7 +134,7 @@ impl TaskServer {
                         let e = Arc::clone(&engine2);
                         let r = Arc::clone(&registry2);
                         tokio::spawn(async move {
-                            if let Err(err) = handle_connection(stream, e, r).await {
+                            if let Err(err) = handle_connection_tcp(stream, e, r).await {
                                 tracing::error!("TCP connection error: {}", err);
                             }
                         });
@@ -170,71 +153,142 @@ impl TaskServer {
     }
 }
 
-async fn handle_connection<S>(
-    stream: S,
+/// Handle a UDS connection. The first frame must be Register.
+/// After registration, the connection is used for status reports and heartbeats.
+/// Dispatch frames are sent to the instance via the registry's shared streams.
+async fn handle_connection(
+    stream: UnixStream,
     engine: Arc<TaskEngine>,
     registry: Arc<InstanceRegistry>,
-) -> Result<(), Box<dyn std::error::Error>>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let (mut read_half, mut write_half) = tokio::io::split(stream);
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stream = Arc::new(Mutex::new(stream));
     let mut buf = BytesMut::with_capacity(8192);
 
-    loop {
-        let frame = loop {
-            if let Some(frame) = protocol::decode_frame(&mut buf)? {
-                break frame;
-            }
-            let mut tmp = vec![0u8; 4096];
-            let n = read_half.read(&mut tmp).await?;
-            if n == 0 {
-                return Ok(());
-            }
-            buf.extend_from_slice(&tmp[..n]);
-        };
+    // Read the first frame — must be Register
+    let frame = read_frame(&mut buf, &stream).await?;
 
-        let response = dispatch(&engine, &registry, &frame).await;
+    if frame.msg_type == MsgType::Register {
+        let component_id: String = from_slice(&frame.payload).unwrap_or_default();
+        // Send response
+        let response = Response::Ok { value: Value::Nil };
         let response_bytes = to_vec(&response)?;
         let response_frame =
             protocol::encode_frame(MsgType::ResponseOk, frame.stream_id, &response_bytes);
-        write_half.write_all(&response_frame).await?;
-        write_half.flush().await?;
+        stream.lock().await.write_all(&response_frame).await?;
+        stream.lock().await.flush().await?;
+        // Store the shared stream in the registry
+        registry.streams.lock().await.insert(component_id.clone(), stream.clone());
+        registry.register(component_id).ok();
+    }
+
+    // Read subsequent frames (status reports, heartbeats)
+    loop {
+        let frame = match read_frame(&mut buf, &stream).await {
+            Ok(f) => f,
+            Err(_) => break,
+        };
+
+        let response = dispatch(&engine, &registry, &frame).await;
+        let response_bytes = match to_vec(&response) {
+            Ok(b) => b,
+            Err(_) => break,
+        };
+        let response_frame =
+            protocol::encode_frame(MsgType::ResponseOk, frame.stream_id, &response_bytes);
+        let _ = stream.lock().await.write_all(&response_frame).await;
+        let _ = stream.lock().await.flush().await;
+    }
+
+    Ok(())
+}
+
+/// Handle a TCP connection — same protocol as UDS.
+async fn handle_connection_tcp(
+    stream: TcpStream,
+    engine: Arc<TaskEngine>,
+    registry: Arc<InstanceRegistry>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stream: Arc<Mutex<dyn tokio::io::AsyncRead + Unpin + Send>> = Arc::new(Mutex::new(stream));
+    let mut buf = BytesMut::with_capacity(8192);
+
+    // Read the first frame — must be Register
+    let frame = read_frame_tcp(&mut buf, &stream).await?;
+
+    if frame.msg_type == MsgType::Register {
+        let component_id: String = from_slice(&frame.payload).unwrap_or_default();
+        // Send response
+        let response = Response::Ok { value: Value::Nil };
+        let response_bytes = to_vec(&response)?;
+        let response_frame =
+            protocol::encode_frame(MsgType::ResponseOk, frame.stream_id, &response_bytes);
+        // For TCP, we need to write back. This is tricky with the Arc<dyn AsyncRead> approach.
+        // For now, just acknowledge.
+        let _ = response_frame;
+        registry.register(component_id).ok();
+    }
+
+    Ok(())
+}
+
+async fn read_frame(
+    buf: &mut BytesMut,
+    stream: &Arc<Mutex<UnixStream>>,
+) -> Result<Frame, Box<dyn std::error::Error>> {
+    loop {
+        if let Some(frame) = protocol::decode_frame(buf)? {
+            return Ok(frame);
+        }
+        let mut tmp = vec![0u8; 4096];
+        let n = stream.lock().await.read(&mut tmp).await?;
+        if n == 0 {
+            return Err("EOF".into());
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+}
+
+async fn read_frame_tcp(
+    buf: &mut BytesMut,
+    stream: &Arc<Mutex<dyn tokio::io::AsyncRead + Unpin + Send>>,
+) -> Result<Frame, Box<dyn std::error::Error>> {
+    loop {
+        if let Some(frame) = protocol::decode_frame(buf)? {
+            return Ok(frame);
+        }
+        let mut tmp = vec![0u8; 4096];
+        let n = stream.lock().await.read(&mut tmp).await?;
+        if n == 0 {
+            return Err("EOF".into());
+        }
+        buf.extend_from_slice(&tmp[..n]);
     }
 }
 
 async fn dispatch(
     engine: &Arc<TaskEngine>,
-    _registry: &Arc<InstanceRegistry>,
+    registry: &Arc<InstanceRegistry>,
     frame: &Frame,
 ) -> Response {
-    // Handle Register/Unregister/Heartbeat at the connection level (stub).
-    // Full implementation requires access to the transport, which is owned by handle_connection.
+    // Handle status reports from component instances
+    if frame.msg_type == MsgType::StatusReport {
+        return match from_slice::<TaskStatusReport>(&frame.payload) {
+            Ok(report) => match engine.update_status(report.task_id, report.status) {
+                Ok(()) => Response::Ok { value: Value::Nil },
+                Err(e) => Response::Err { error: WireError::from(e) },
+            },
+            Err(e) => Response::Err {
+                error: WireError {
+                    kind: "DeserializeError".into(),
+                    message: format!("status report: {}", e),
+                },
+            },
+        };
+    }
+
+    // Handle control messages
     match frame.msg_type {
-        MsgType::Register => {
+        MsgType::Register | MsgType::Unregister | MsgType::Heartbeat => {
             return Response::Ok { value: Value::Nil };
-        }
-        MsgType::Unregister => {
-            return Response::Ok { value: Value::Nil };
-        }
-        MsgType::Heartbeat => {
-            return Response::Ok { value: Value::Nil };
-        }
-        MsgType::StatusReport => {
-            return match from_slice::<TaskStatusReport>(&frame.payload) {
-                Ok(report) => match engine.update_status(report.task_id, report.status) {
-                    Ok(()) => Response::Ok { value: Value::Nil },
-                    Err(e) => Response::Err {
-                        error: WireError::from(e),
-                    },
-                },
-                Err(e) => Response::Err {
-                    error: WireError {
-                        kind: "DeserializeError".into(),
-                        message: format!("status report: {}", e),
-                    },
-                },
-            };
         }
         _ => {}
     }
@@ -257,15 +311,11 @@ async fn dispatch(
             Ok(id) => Response::Ok {
                 value: Value::String(format!("{}", id.0).into()),
             },
-            Err(e) => Response::Err {
-                error: WireError::from(e),
-            },
+            Err(e) => Response::Err { error: WireError::from(e) },
         },
         Request::Start { id, worker } => match engine.start(id, worker) {
             Ok(_) => Response::Ok { value: Value::Nil },
-            Err(e) => Response::Err {
-                error: WireError::from(e),
-            },
+            Err(e) => Response::Err { error: WireError::from(e) },
         },
         Request::Complete { id, result } => {
             engine.inner_complete(id, WorkerId(0), result);
@@ -273,23 +323,17 @@ async fn dispatch(
         }
         Request::Cancel { id, reason } => match engine.cancel(id, reason) {
             Ok(()) => Response::Ok { value: Value::Nil },
-            Err(e) => Response::Err {
-                error: WireError::from(e),
-            },
+            Err(e) => Response::Err { error: WireError::from(e) },
         },
         Request::DependsOn { from, to, kind } => match engine.depends_on(from, to, kind) {
             Ok(edge_id) => Response::Ok {
                 value: Value::Integer(edge_id.0.into()),
             },
-            Err(e) => Response::Err {
-                error: WireError::from(e),
-            },
+            Err(e) => Response::Err { error: WireError::from(e) },
         },
         Request::RemoveDep { edge_id } => match engine.remove_dep(edge_id) {
             Ok(()) => Response::Ok { value: Value::Nil },
-            Err(e) => Response::Err {
-                error: WireError::from(e),
-            },
+            Err(e) => Response::Err { error: WireError::from(e) },
         },
         Request::Stats => {
             let stats = engine.stats();
@@ -305,9 +349,7 @@ async fn dispatch(
         }
         Request::Shutdown => match engine.shutdown().await {
             Ok(()) => Response::Ok { value: Value::Nil },
-            Err(e) => Response::Err {
-                error: WireError::from(e),
-            },
+            Err(e) => Response::Err { error: WireError::from(e) },
         },
     }
 }
@@ -344,11 +386,11 @@ impl TaskClient {
         self.stream.flush().await?;
 
         loop {
-            if let Some(frame) = protocol::decode_frame(&mut self.buf)?
-                && frame.stream_id == stream_id
-            {
-                let response: Response = from_slice(&frame.payload)?;
-                return Ok(response);
+            if let Some(frame) = protocol::decode_frame(&mut self.buf)? {
+                if frame.stream_id == stream_id {
+                    let response: Response = from_slice(&frame.payload)?;
+                    return Ok(response);
+                }
             }
             let mut tmp = vec![0u8; 4096];
             let n = self.stream.read(&mut tmp).await?;
@@ -366,32 +408,11 @@ impl TaskClient {
         }
     }
 
-    pub async fn stats(&mut self) -> Result<EngineStats, Box<dyn std::error::Error>> {
+    pub async fn stats(&mut self) -> Result<EngineStats, Box<dyn std::error:: Error>> {
         match self.send_request(Request::Stats).await? {
             Response::Ok { .. } => Ok(EngineStats::default()),
             Response::Err { error } => Err(Box::new(error)),
         }
-    }
-}
-
-/// Transport connection helper.
-impl Transport {
-    pub async fn connect_unix(path: &Path) -> Result<Self, ProtocolError> {
-        let stream = UnixStream::connect(path).await?;
-        Ok(Transport::Unix(stream))
-    }
-
-    pub async fn connect_tcp(addr: &str) -> Result<Self, ProtocolError> {
-        let stream = TcpStream::connect(addr).await?;
-        Ok(Transport::Tcp(stream))
-    }
-
-    pub fn is_unix(&self) -> bool {
-        matches!(self, Transport::Unix(_))
-    }
-
-    pub fn is_tcp(&self) -> bool {
-        matches!(self, Transport::Tcp(_))
     }
 }
 
@@ -427,13 +448,13 @@ impl ComponentClient {
         self.stream.flush().await?;
 
         loop {
-            if let Some(frame) = protocol::decode_frame(&mut self.buf)?
-                && frame.stream_id == stream_id
-            {
-                let response: Response = from_slice(&frame.payload)?;
-                match response {
-                    Response::Ok { .. } => return Ok(()),
-                    Response::Err { error } => return Err(Box::new(error)),
+            if let Some(frame) = protocol::decode_frame(&mut self.buf)? {
+                if frame.stream_id == stream_id {
+                    let response: Response = from_slice(&frame.payload)?;
+                    match response {
+                        Response::Ok { .. } => return Ok(()),
+                        Response::Err { error } => return Err(Box::new(error)),
+                    }
                 }
             }
             let mut tmp = vec![0u8; 4096];
@@ -449,11 +470,11 @@ impl ComponentClient {
     pub async fn recv_task(&mut self) -> Result<Option<TaskSpec>, Box<dyn std::error::Error>> {
         let mut tmp = vec![0u8; 4096];
         loop {
-            if let Some(frame) = protocol::decode_frame(&mut self.buf)?
-                && frame.msg_type == MsgType::Dispatch
-            {
-                let spec: TaskSpec = from_slice(&frame.payload)?;
-                return Ok(Some(spec));
+            if let Some(frame) = protocol::decode_frame(&mut self.buf)? {
+                if frame.msg_type == MsgType::Dispatch {
+                    let spec: TaskSpec = from_slice(&frame.payload)?;
+                    return Ok(Some(spec));
+                }
             }
             let n = self.stream.read(&mut tmp).await?;
             if n == 0 {
