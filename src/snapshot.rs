@@ -76,7 +76,7 @@ fn write_task(w: &mut BufWriter<File>, task: &Task) -> std::io::Result<()> {
     };
     w.write_u8(status_tag)?;
 
-    // status_payload: worker_id (8 bytes) for Running, output_ref/error_code for Completed, reason for Cancelled.
+    // status_payload
     match &task.status {
         TaskStatus::Running { worker_id } => {
             w.write_u32::<LittleEndian>(8)?;
@@ -112,6 +112,11 @@ fn write_task(w: &mut BufWriter<File>, task: &Task) -> std::io::Result<()> {
 
     // priority (1 byte, i8)
     w.write_i8(task.spec.priority.0)?;
+
+    // component_id: len (2 bytes) + bytes
+    let cid_bytes = task.spec.component_id.as_bytes();
+    w.write_u16::<LittleEndian>(cid_bytes.len() as u16)?;
+    w.write_all(cid_bytes)?;
 
     // timestamps (8 bytes each)
     w.write_u64::<LittleEndian>(task.created_at)?;
@@ -295,6 +300,13 @@ fn read_task(file: &mut File) -> std::io::Result<Task> {
     // priority
     let priority = Priority(file.read_i8()?);
 
+    // component_id
+    let cid_len = file.read_u16::<LittleEndian>()? as usize;
+    let mut cid_buf = vec![0u8; cid_len];
+    file.read_exact(&mut cid_buf)?;
+    let component_id = String::from_utf8(cid_buf)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
     // timestamps
     let created_at = file.read_u64::<LittleEndian>()?;
     let updated_at = file.read_u64::<LittleEndian>()?;
@@ -335,6 +347,7 @@ fn read_task(file: &mut File) -> std::io::Result<Task> {
             task_type,
             payload,
             priority,
+            component_id,
             parent,
             blocking_on: vec![], // Rebuilt during recovery.
             metadata,

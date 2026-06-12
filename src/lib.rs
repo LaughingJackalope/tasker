@@ -2,6 +2,7 @@ pub mod engine;
 pub mod error;
 pub mod journal;
 pub mod protocol;
+pub mod registry;
 pub mod rpc;
 pub mod snapshot;
 pub mod types;

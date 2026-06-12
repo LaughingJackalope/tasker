@@ -95,6 +95,7 @@ pub struct TaskSpec {
     pub task_type: String,
     pub payload: Vec<u8>,
     pub priority: Priority,
+    pub component_id: String,
     pub parent: Option<TaskId>,
     pub blocking_on: Vec<TaskId>,
     pub metadata: Vec<(String, Vec<u8>)>,

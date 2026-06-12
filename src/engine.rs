@@ -7,6 +7,7 @@ use tokio::sync::{Notify, broadcast, mpsc};
 
 use crate::error::EngineError;
 use crate::journal::{JournalRecord, JournalWriter};
+use crate::registry::InstanceRegistry;
 use crate::types::*;
 
 /// RAII guard for in-progress tasks. Dropping without explicit
@@ -62,6 +63,12 @@ pub struct EngineConfig {
     pub snapshot_interval_records: u64,
     /// Timeout in seconds for graceful shutdown.
     pub shutdown_timeout_secs: u64,
+    /// Unix domain socket path for local connections.
+    pub uds_path: String,
+    /// TCP listen address for remote connections.
+    pub tcp_addr: String,
+    /// Heartbeat timeout in seconds for component instances.
+    pub heartbeat_timeout_secs: u64,
 }
 
 impl Default for EngineConfig {
@@ -71,6 +78,9 @@ impl Default for EngineConfig {
             journal_max_segment_bytes: 64 * 1024 * 1024,
             snapshot_interval_records: 10_000,
             shutdown_timeout_secs: 30,
+            uds_path: String::from("/tmp/tasker.sock"),
+            tcp_addr: String::from("0.0.0.0:7878"),
+            heartbeat_timeout_secs: 30,
         }
     }
 }
@@ -173,6 +183,8 @@ pub struct TaskEngine {
     counters: Counters,
     /// Append-only journal for durability.
     journal: Arc<tokio::sync::Mutex<JournalWriter>>,
+    /// Instance registry for multi-component dispatch.
+    registry: Arc<InstanceRegistry>,
 }
 
 impl TaskEngine {
@@ -181,7 +193,6 @@ impl TaskEngine {
         Self::with_config(config)
     }
 
-    /// Create an engine with explicit configuration.
     pub fn with_config(config: EngineConfig) -> Arc<Self> {
         let (ready_tx, ready_rx) = mpsc::channel(65_536);
         let (status_tx, _) = broadcast::channel(4096);
@@ -190,6 +201,7 @@ impl TaskEngine {
             config.journal_max_segment_bytes,
         )
         .expect("failed to create journal");
+        let registry = InstanceRegistry::new(config.heartbeat_timeout_secs);
         Arc::new(Self {
             tasks: DashMap::new(),
             edges: DashMap::new(),
@@ -203,6 +215,7 @@ impl TaskEngine {
             shutdown: AtomicBool::new(false),
             counters: Counters::new(),
             journal: Arc::new(tokio::sync::Mutex::new(journal)),
+            registry,
         })
     }
 
@@ -750,16 +763,30 @@ impl TaskEngine {
         Ok(())
     }
 
-    /// Access a task by ID (for testing / inspection).
+    /// Dispatch a Ready task to its registered component instance.
+    pub fn dispatch(&self, id: TaskId) -> Result<(), EngineError> {
+        let task = self.tasks.get(&id).ok_or(EngineError::NotFound(id))?;
+        if !matches!(task.status, TaskStatus::Ready) {
+            return Err(EngineError::InvalidTransition {
+                id,
+                from: task.status,
+                attempted: "dispatch",
+            });
+        }
+        let component_id = &task.spec.component_id;
+        let _conn = self
+            .registry
+            .get(component_id)
+            .ok_or_else(|| EngineError::NoInstance(component_id.clone()))?;
+        // TODO: send task over transport
+        Ok(())
+    }
+
     #[cfg(test)]
     pub fn get_task(&self, id: TaskId) -> Option<Task> {
         self.tasks.get(&id).map(|t| t.clone())
     }
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -774,6 +801,7 @@ mod tests {
             task_type: task_type.to_string(),
             payload: vec![],
             priority: Priority(0),
+            component_id: "default".into(),
             parent: None,
             blocking_on: vec![],
             metadata: vec![],
@@ -815,11 +843,9 @@ mod tests {
             })
             .unwrap();
 
-        // Start and complete A.
         let mut guard = engine.start(a, WorkerId(1)).unwrap();
         guard.complete(TaskResult::Ok { output_ref: 42 });
 
-        // B should now be Ready.
         let task = engine.get_task(b).unwrap();
         assert!(matches!(task.status, TaskStatus::Ready));
         assert_eq!(task.edge_in_degree, 0);
@@ -829,7 +855,7 @@ mod tests {
     fn test_start_task_returns_guard() {
         let engine = TaskEngine::new();
         let id = engine.create(make_spec("test")).unwrap();
-        let guard = engine.start(id, WorkerId(1)).unwrap();
+        let _guard = engine.start(id, WorkerId(1)).unwrap();
         let task = engine.get_task(id).unwrap();
         assert!(matches!(
             task.status,
@@ -837,7 +863,6 @@ mod tests {
                 worker_id: WorkerId(1)
             }
         ));
-        drop(guard);
     }
 
     #[test]
@@ -907,22 +932,15 @@ mod tests {
     #[test]
     fn test_cancel_running_cascades_to_children() {
         let engine = TaskEngine::new();
-        let parent = engine
-            .create(TaskSpec {
-                parent: None,
-                ..make_spec("parent")
-            })
-            .unwrap();
+        let parent = engine.create(make_spec("parent")).unwrap();
         let child = engine
             .create(TaskSpec {
                 parent: Some(parent),
                 ..make_spec("child")
             })
             .unwrap();
-        // Start the child and keep it running.
-        let _guard = engine.start(child, WorkerId(1)).unwrap();
 
-        // Cancel parent — should cascade to child.
+        let _guard = engine.start(child, WorkerId(1)).unwrap();
         let _ = engine.cancel(parent, 42);
 
         let child_task = engine.get_task(child).unwrap();
@@ -943,7 +961,6 @@ mod tests {
             })
             .unwrap();
 
-        // a depends on b (blocking) — should create a cycle.
         let err = engine.depends_on(b, a, EdgeKind::Blocking).unwrap_err();
         assert!(matches!(err, EngineError::CycleDetected { .. }));
     }
@@ -955,7 +972,6 @@ mod tests {
         let mut guard = engine.start(a, WorkerId(1)).unwrap();
         guard.complete(TaskResult::Ok { output_ref: 1 });
 
-        // Now create B with A as a blocking dep — A is already completed.
         let b = engine
             .create(TaskSpec {
                 blocking_on: vec![a],
@@ -979,7 +995,6 @@ mod tests {
             })
             .unwrap();
 
-        // Find the edge ID.
         let edge_id = engine
             .edges
             .iter()
@@ -987,7 +1002,6 @@ mod tests {
             .map(|e| e.value().id)
             .unwrap();
 
-        // Remove it.
         engine.remove_dep(edge_id).unwrap();
 
         let task = engine.get_task(b).unwrap();
@@ -1001,7 +1015,6 @@ mod tests {
 
         let id = engine.create(make_spec("test")).unwrap();
 
-        // Should receive the Ready notification.
         let (recv_id, status, _) = rx.try_recv().unwrap();
         assert_eq!(recv_id, id);
         assert!(matches!(status, TaskStatus::Ready));
@@ -1025,8 +1038,8 @@ mod tests {
             .unwrap();
 
         let stats = engine.stats();
-        assert_eq!(stats.ready, 1); // a
-        assert_eq!(stats.pending, 2); // b, c
+        assert_eq!(stats.ready, 1);
+        assert_eq!(stats.pending, 2);
         assert_eq!(stats.running, 0);
         assert_eq!(stats.completed, 0);
     }
@@ -1047,14 +1060,12 @@ mod tests {
         assert_eq!(task.edge_in_degree, 2);
         assert!(matches!(task.status, TaskStatus::Pending));
 
-        // Complete one — still pending.
         let mut guard = engine.start(a, WorkerId(1)).unwrap();
         guard.complete(TaskResult::Ok { output_ref: 1 });
         let task = engine.get_task(c).unwrap();
         assert!(matches!(task.status, TaskStatus::Pending));
         assert_eq!(task.edge_in_degree, 1);
 
-        // Complete the other — now ready.
         let mut guard = engine.start(b, WorkerId(2)).unwrap();
         guard.complete(TaskResult::Ok { output_ref: 2 });
         let task = engine.get_task(c).unwrap();
@@ -1109,12 +1120,7 @@ mod tests {
     #[test]
     fn test_parent_child_tracking() {
         let engine = TaskEngine::new();
-        let parent = engine
-            .create(TaskSpec {
-                parent: None,
-                ..make_spec("parent")
-            })
-            .unwrap();
+        let parent = engine.create(make_spec("parent")).unwrap();
         let child = engine
             .create(TaskSpec {
                 parent: Some(parent),
@@ -1127,5 +1133,38 @@ mod tests {
 
         let child_task = engine.get_task(child).unwrap();
         assert_eq!(child_task.spec.parent, Some(parent));
+    }
+
+    #[test]
+    fn test_dispatch_no_instance() {
+        let engine = TaskEngine::new();
+        let id = engine
+            .create(TaskSpec {
+                component_id: "nonexistent".into(),
+                ..make_spec("test")
+            })
+            .unwrap();
+        let err = engine.dispatch(id).unwrap_err();
+        assert!(matches!(err, EngineError::NoInstance(_)));
+    }
+
+    #[test]
+    fn test_dispatch_not_ready() {
+        let engine = TaskEngine::new();
+        let a = engine.create(make_spec("a")).unwrap();
+        let b = engine
+            .create(TaskSpec {
+                blocking_on: vec![a],
+                ..make_spec("b")
+            })
+            .unwrap();
+        let err = engine.dispatch(b).unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::InvalidTransition {
+                attempted: "dispatch",
+                ..
+            }
+        ));
     }
 }

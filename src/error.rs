@@ -35,4 +35,10 @@ pub enum EngineError {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    #[error("no instance registered for component {0}")]
+    NoInstance(String),
+
+    #[error("transport error: {0}")]
+    TransportError(String),
 }
