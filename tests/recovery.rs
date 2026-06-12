@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-use std::sync::Arc;
 use tempfile::TempDir;
 
 use tasker::engine::TaskEngine;
