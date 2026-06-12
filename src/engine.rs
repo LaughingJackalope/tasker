@@ -1,9 +1,9 @@
 use dashmap::DashMap;
 use rand::Rng;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, Notify};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use tokio::sync::{Notify, broadcast, mpsc};
 
 use crate::error::EngineError;
 use crate::journal::{JournalRecord, JournalWriter};
@@ -176,13 +176,18 @@ pub struct TaskEngine {
 }
 
 impl TaskEngine {
-    /// Create a new empty engine.
     pub fn new() -> Arc<Self> {
+        let config = EngineConfig::default();
+        Self::with_config(config)
+    }
+
+    /// Create an engine with explicit configuration.
+    pub fn with_config(config: EngineConfig) -> Arc<Self> {
         let (ready_tx, ready_rx) = mpsc::channel(65_536);
         let (status_tx, _) = broadcast::channel(4096);
         let journal = JournalWriter::new(
-            std::path::Path::new(".tasker-data"),
-            64 * 1024 * 1024,
+            std::path::Path::new(&config.data_dir),
+            config.journal_max_segment_bytes,
         )
         .expect("failed to create journal");
         Arc::new(Self {
@@ -205,6 +210,7 @@ impl TaskEngine {
         self.seq.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Current unix timestamp in millis.
     fn now_millis(&self) -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -212,7 +218,6 @@ impl TaskEngine {
             .as_millis()
             .min(u64::MAX as u128) as u64
     }
-
     /// Transition a task's status, update counters, broadcast.
     fn transition(&self, id: TaskId, from: TaskStatus, to: TaskStatus) {
         self.counters.dec(from);
