@@ -9,11 +9,17 @@ use rmpv::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 
-use crate::engine::TaskEngine;
-use crate::error::EngineError;
 use crate::protocol::{self, Frame, MsgType, ProtocolError};
 use crate::registry::{InstanceRegistry, Transport};
 use crate::types::*;
+
+/// Status report sent by component instances back to tasker.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TaskStatusReport {
+    pub task_id: TaskId,
+    pub status: TaskStatus,
+    pub component_id: String,
+}
 
 /// Request enum — serialized over the wire as MessagePack.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -76,6 +82,9 @@ pub enum Response {
     Err { error: WireError },
 }
 
+use crate::engine::TaskEngine;
+use crate::error::EngineError;
+
 /// Server that listens on both UDS and TCP, dispatching to the engine.
 pub struct TaskServer {
     engine: Arc<TaskEngine>,
@@ -105,9 +114,7 @@ impl TaskServer {
         let engine = Arc::clone(&self.engine);
         let registry = Arc::clone(&self.registry);
 
-        // Remove stale socket.
         let _ = std::fs::remove_file(&uds_path);
-
         let uds_listener = UnixListener::bind(&uds_path)?;
         let tcp_listener = TcpListener::bind(&tcp_addr).await?;
 
@@ -120,7 +127,6 @@ impl TaskServer {
         let engine2 = Arc::clone(&engine);
         let registry2 = Arc::clone(&registry);
 
-        // Spawn UDS accept loop.
         let uds_handle = tokio::spawn(async move {
             loop {
                 match uds_listener.accept().await {
@@ -138,7 +144,6 @@ impl TaskServer {
             }
         });
 
-        // Spawn TCP accept loop.
         let tcp_handle = tokio::spawn(async move {
             loop {
                 match tcp_listener.accept().await {
@@ -203,6 +208,39 @@ async fn dispatch(
     _registry: &Arc<InstanceRegistry>,
     frame: &Frame,
 ) -> Response {
+    // Handle Register/Unregister/Heartbeat at the connection level (stub).
+    // Full implementation requires access to the transport, which is owned by handle_connection.
+    match frame.msg_type {
+        MsgType::Register => {
+            return Response::Ok { value: Value::Nil };
+        }
+        MsgType::Unregister => {
+            return Response::Ok { value: Value::Nil };
+        }
+        MsgType::Heartbeat => {
+            return Response::Ok { value: Value::Nil };
+        }
+        MsgType::StatusReport => {
+            // Parse and update task status
+            match from_slice::<TaskStatusReport>(&frame.payload) {
+                Ok(_report) => {
+                    // TODO: update engine with status
+                    return Response::Ok { value: Value::Nil };
+                }
+                Err(e) => {
+                    return Response::Err {
+                        error: WireError {
+                            kind: "DeserializeError".into(),
+                            message: format!("status report: {}", e),
+                        },
+                    };
+                }
+            }
+        }
+        _ => {}
+    }
+
+    // Handle task-related requests
     let request: Request = match from_slice(&frame.payload) {
         Ok(r) => r,
         Err(e) => {
@@ -218,7 +256,7 @@ async fn dispatch(
     match request {
         Request::Create { spec } => match engine.create(spec) {
             Ok(id) => Response::Ok {
-                value: Value::String(id.0.to_string().into()),
+                value: Value::String(format!("{}", id.0).into()),
             },
             Err(e) => Response::Err {
                 error: WireError::from(e),
@@ -337,6 +375,7 @@ impl TaskClient {
     }
 }
 
+/// Transport connection helper.
 impl Transport {
     pub async fn connect_unix(path: &Path) -> Result<Self, ProtocolError> {
         let stream = UnixStream::connect(path).await?;
@@ -388,7 +427,6 @@ impl ComponentClient {
         self.stream.write_all(&frame).await?;
         self.stream.flush().await?;
 
-        // Wait for response.
         loop {
             if let Some(frame) = protocol::decode_frame(&mut self.buf)?
                 && frame.stream_id == stream_id
@@ -410,19 +448,38 @@ impl ComponentClient {
 
     /// Receive a dispatched task from the tasker.
     pub async fn recv_task(&mut self) -> Result<Option<TaskSpec>, Box<dyn std::error::Error>> {
-        // Check if there's a Dispatch frame waiting.
-        // In a real implementation, this would be a proper async read loop.
-        // For now, return None (placeholder).
-        Ok(None)
+        let mut tmp = vec![0u8; 4096];
+        loop {
+            if let Some(frame) = protocol::decode_frame(&mut self.buf)?
+                && frame.msg_type == MsgType::Dispatch
+            {
+                let spec: TaskSpec = from_slice(&frame.payload)?;
+                return Ok(Some(spec));
+            }
+            let n = self.stream.read(&mut tmp).await?;
+            if n == 0 {
+                return Ok(None);
+            }
+            self.buf.extend_from_slice(&tmp[..n]);
+        }
     }
 
     /// Report task status back to the tasker.
     pub async fn report_status(
         &mut self,
-        _task_id: TaskId,
-        _status: TaskStatus,
+        task_id: TaskId,
+        status: TaskStatus,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // TODO: implement status reporting
+        let stream_id = self.alloc_stream_id();
+        let report = TaskStatusReport {
+            task_id,
+            status,
+            component_id: self.component_id.clone(),
+        };
+        let payload = to_vec(&report)?;
+        let frame = protocol::encode_frame(MsgType::StatusReport, stream_id, &payload);
+        self.stream.write_all(&frame).await?;
+        self.stream.flush().await?;
         Ok(())
     }
 

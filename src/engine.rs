@@ -7,6 +7,7 @@ use tokio::sync::{Notify, broadcast, mpsc};
 
 use crate::error::EngineError;
 use crate::journal::{JournalRecord, JournalWriter};
+use crate::protocol::{self, MsgType};
 use crate::registry::InstanceRegistry;
 use crate::types::*;
 
@@ -764,7 +765,7 @@ impl TaskEngine {
     }
 
     /// Dispatch a Ready task to its registered component instance.
-    pub fn dispatch(&self, id: TaskId) -> Result<(), EngineError> {
+    pub async fn dispatch(&self, id: TaskId) -> Result<(), EngineError> {
         let task = self.tasks.get(&id).ok_or(EngineError::NotFound(id))?;
         if !matches!(task.status, TaskStatus::Ready) {
             return Err(EngineError::InvalidTransition {
@@ -774,11 +775,19 @@ impl TaskEngine {
             });
         }
         let component_id = &task.spec.component_id;
-        let _conn = self
+        let conn = self
             .registry
             .get(component_id)
             .ok_or_else(|| EngineError::NoInstance(component_id.clone()))?;
-        // TODO: send task over transport
+
+        // Serialize task spec as a Dispatch frame
+        let payload =
+            rmp_serde::to_vec(&task.spec).map_err(|e| EngineError::Internal(e.to_string()))?;
+        let frame = protocol::encode_frame(MsgType::Dispatch, 0, &payload);
+        conn.send_frame(&frame)
+            .await
+            .map_err(|e| EngineError::TransportError(e.to_string()))?;
+
         Ok(())
     }
 
@@ -1135,8 +1144,8 @@ mod tests {
         assert_eq!(child_task.spec.parent, Some(parent));
     }
 
-    #[test]
-    fn test_dispatch_no_instance() {
+    #[tokio::test]
+    async fn test_dispatch_no_instance() {
         let engine = TaskEngine::new();
         let id = engine
             .create(TaskSpec {
@@ -1144,12 +1153,12 @@ mod tests {
                 ..make_spec("test")
             })
             .unwrap();
-        let err = engine.dispatch(id).unwrap_err();
+        let err = engine.dispatch(id).await.unwrap_err();
         assert!(matches!(err, EngineError::NoInstance(_)));
     }
 
-    #[test]
-    fn test_dispatch_not_ready() {
+    #[tokio::test]
+    async fn test_dispatch_not_ready() {
         let engine = TaskEngine::new();
         let a = engine.create(make_spec("a")).unwrap();
         let b = engine
@@ -1158,7 +1167,7 @@ mod tests {
                 ..make_spec("b")
             })
             .unwrap();
-        let err = engine.dispatch(b).unwrap_err();
+        let err = engine.dispatch(b).await.unwrap_err();
         assert!(matches!(
             err,
             EngineError::InvalidTransition {

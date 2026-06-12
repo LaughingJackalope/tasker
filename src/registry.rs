@@ -1,7 +1,7 @@
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use tokio::net::{TcpStream, UnixStream};
 
@@ -16,7 +16,7 @@ pub enum Transport {
 /// A registered component instance.
 pub struct InstanceConnection {
     pub component_id: String,
-    pub transport: Transport,
+    pub transport: tokio::sync::Mutex<Transport>,
     pub last_heartbeat: AtomicU64,
 }
 
@@ -24,7 +24,7 @@ impl InstanceConnection {
     pub fn new(component_id: String, transport: Transport) -> Self {
         Self {
             component_id,
-            transport,
+            transport: tokio::sync::Mutex::new(transport),
             last_heartbeat: AtomicU64::new(now_millis()),
         }
     }
@@ -37,11 +37,27 @@ impl InstanceConnection {
         let elapsed = now_millis() - self.last_heartbeat.load(Ordering::Relaxed);
         elapsed < timeout_secs * 1000
     }
-}
 
+    /// Send a frame over this instance's transport.
+    pub async fn send_frame(&self, frame: &[u8]) -> Result<(), ProtocolError> {
+        use tokio::io::AsyncWriteExt;
+        let mut transport = self.transport.lock().await;
+        match &mut *transport {
+            Transport::Unix(stream) => {
+                stream.write_all(frame).await?;
+                stream.flush().await?;
+            }
+            Transport::Tcp(stream) => {
+                stream.write_all(frame).await?;
+                stream.flush().await?;
+            }
+        }
+        Ok(())
+    }
+}
 fn now_millis() -> u64 {
     SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+        .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
         .min(u64::MAX as u128) as u64
