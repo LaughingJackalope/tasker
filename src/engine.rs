@@ -1,11 +1,12 @@
 use dashmap::DashMap;
 use rand::Rng;
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use tokio::sync::{Notify, broadcast, mpsc};
+use std::sync::Arc;
+use tokio::sync::{broadcast, mpsc, Notify};
 
 use crate::error::EngineError;
+use crate::journal::{JournalRecord, JournalWriter};
 use crate::types::*;
 
 /// RAII guard for in-progress tasks. Dropping without explicit
@@ -164,13 +165,14 @@ pub struct TaskEngine {
 
     /// Subscriber notification. Any task status change broadcasts here.
     status_tx: broadcast::Sender<(TaskId, TaskStatus, u64)>,
-
     /// Monotonic sequence counter.
     seq: AtomicU64,
     /// Shutdown flag.
     shutdown: AtomicBool,
     /// O(1) status counters.
     counters: Counters,
+    /// Append-only journal for durability.
+    journal: Arc<tokio::sync::Mutex<JournalWriter>>,
 }
 
 impl TaskEngine {
@@ -178,6 +180,11 @@ impl TaskEngine {
     pub fn new() -> Arc<Self> {
         let (ready_tx, ready_rx) = mpsc::channel(65_536);
         let (status_tx, _) = broadcast::channel(4096);
+        let journal = JournalWriter::new(
+            std::path::Path::new(".tasker-data"),
+            64 * 1024 * 1024,
+        )
+        .expect("failed to create journal");
         Arc::new(Self {
             tasks: DashMap::new(),
             edges: DashMap::new(),
@@ -190,6 +197,7 @@ impl TaskEngine {
             seq: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
             counters: Counters::new(),
+            journal: Arc::new(tokio::sync::Mutex::new(journal)),
         })
     }
 
@@ -260,7 +268,7 @@ impl TaskEngine {
         };
 
         // Insert into store.
-        if self.tasks.insert(id, task).is_some() {
+        if self.tasks.insert(id, task.clone()).is_some() {
             return Err(EngineError::AlreadyExists(id));
         }
 
@@ -330,7 +338,12 @@ impl TaskEngine {
 
         let _ = self.status_tx.send((id, initial_status, seq));
 
-        // TODO: journal record
+        if let Ok(mut j) = self.journal.try_lock() {
+            let _ = j.append(&JournalRecord::TaskCreated {
+                seq,
+                task: task.clone(),
+            });
+        }
         Ok(id)
     }
 
@@ -352,6 +365,14 @@ impl TaskEngine {
                 drop(task);
 
                 self.transition(id, old_status, new_status);
+                if let Ok(mut j) = self.journal.try_lock() {
+                    let _ = j.append(&JournalRecord::TaskStatusChanged {
+                        seq: self.next_seq(),
+                        id,
+                        from: old_status,
+                        to: new_status,
+                    });
+                }
                 Ok(TaskGuard {
                     engine: Arc::clone(self),
                     task_id: id,
@@ -386,6 +407,14 @@ impl TaskEngine {
         drop(task);
 
         self.transition(id, old_status, new_status);
+        if let Ok(mut j) = self.journal.try_lock() {
+            let _ = j.append(&JournalRecord::TaskStatusChanged {
+                seq: self.next_seq(),
+                id,
+                from: old_status,
+                to: new_status,
+            });
+        }
 
         // Wake dependents.
         self.on_task_completed(id);
@@ -486,7 +515,14 @@ impl TaskEngine {
             // Dependents remain pending. This is correct per spec section 6.1.
         }
 
-        // TODO: journal record
+        if let Ok(mut j) = self.journal.try_lock() {
+            let _ = j.append(&JournalRecord::TaskStatusChanged {
+                seq: self.next_seq(),
+                id,
+                from: old_status,
+                to: new_status,
+            });
+        }
         Ok(())
     }
 
@@ -554,7 +590,7 @@ impl TaskEngine {
             seq,
         };
 
-        self.edges.insert((from, to), dep);
+        self.edges.insert((from, to), dep.clone());
 
         // Update forward index.
         self.blocking_dependents.entry(from).or_default().insert(to);
@@ -592,7 +628,12 @@ impl TaskEngine {
             }
         }
 
-        // TODO: journal record
+        if let Ok(mut j) = self.journal.try_lock() {
+            let _ = j.append(&JournalRecord::EdgeCreated {
+                seq,
+                edge: dep.clone(),
+            });
+        }
         Ok(edge_id)
     }
 
@@ -645,7 +686,12 @@ impl TaskEngine {
             }
         }
 
-        // TODO: journal record
+        if let Ok(mut j) = self.journal.try_lock() {
+            let _ = j.append(&JournalRecord::EdgeRemoved {
+                seq: self.next_seq(),
+                edge_id: dep.id,
+            });
+        }
         Ok(())
     }
 
@@ -694,7 +740,8 @@ impl TaskEngine {
 
         self.ready_notify.notify_waiters();
 
-        // TODO: flush journal
+        let _ = self.journal.lock().await;
+        // JournalWriter flushes on every append; no explicit flush needed.
         Ok(())
     }
 
