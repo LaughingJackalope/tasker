@@ -239,6 +239,52 @@ impl TaskEngine {
         let _ = self.status_tx.send((id, to, self.next_seq()));
     }
 
+    /// Update a task's status from a component-reported status change.
+    /// Validates the transition, updates counters, journals, broadcasts,
+    /// and wakes dependents if the task reached a terminal state.
+    pub fn update_status(&self, id: TaskId, new_status: TaskStatus) -> Result<(), EngineError> {
+        let mut task = self.tasks.get_mut(&id).ok_or(EngineError::NotFound(id))?;
+        let old_status = task.status;
+
+        // Terminal states cannot be transitioned out of
+        match old_status {
+            TaskStatus::Completed { .. } | TaskStatus::Cancelled { .. } => {
+                return Err(EngineError::InvalidTransition {
+                    id,
+                    from: old_status,
+                    attempted: "update_status",
+                });
+            }
+            _ => {}
+        }
+
+        task.status = new_status;
+        task.updated_at = self.now_millis();
+        task.seq = self.next_seq();
+        drop(task);
+
+        self.transition(id, old_status, new_status);
+
+        if let Ok(mut j) = self.journal.try_lock() {
+            let _ = j.append(&JournalRecord::TaskStatusChanged {
+                seq: self.next_seq(),
+                id,
+                from: old_status,
+                to: new_status,
+            });
+        }
+
+        // Wake dependents if the task reached a terminal state
+        match new_status {
+            TaskStatus::Completed { .. } | TaskStatus::Cancelled { .. } => {
+                self.on_task_completed(id);
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
     // =========================================================================
     //  Core state machine operations
     // =========================================================================

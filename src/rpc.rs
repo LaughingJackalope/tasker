@@ -221,21 +221,20 @@ async fn dispatch(
             return Response::Ok { value: Value::Nil };
         }
         MsgType::StatusReport => {
-            // Parse and update task status
-            match from_slice::<TaskStatusReport>(&frame.payload) {
-                Ok(_report) => {
-                    // TODO: update engine with status
-                    return Response::Ok { value: Value::Nil };
-                }
-                Err(e) => {
-                    return Response::Err {
-                        error: WireError {
-                            kind: "DeserializeError".into(),
-                            message: format!("status report: {}", e),
-                        },
-                    };
-                }
-            }
+            return match from_slice::<TaskStatusReport>(&frame.payload) {
+                Ok(report) => match engine.update_status(report.task_id, report.status) {
+                    Ok(()) => Response::Ok { value: Value::Nil },
+                    Err(e) => Response::Err {
+                        error: WireError::from(e),
+                    },
+                },
+                Err(e) => Response::Err {
+                    error: WireError {
+                        kind: "DeserializeError".into(),
+                        message: format!("status report: {}", e),
+                    },
+                },
+            };
         }
         _ => {}
     }
