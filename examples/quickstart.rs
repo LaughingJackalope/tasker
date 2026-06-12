@@ -1,4 +1,4 @@
-use tasker::{TaskEngine, TaskResult, TaskSpec, WorkerId, Priority};
+use tasker::{Priority, TaskEngine, TaskResult, TaskSpec, WorkerId};
 
 fn main() {
     let engine = TaskEngine::new();
@@ -50,7 +50,10 @@ fn main() {
         })
         .unwrap();
 
-    println!("Created tasks: root={:?}, a={:?}, b={:?}, final={:?}", root, child_a, child_b, final_task);
+    println!(
+        "Created tasks: root={:?}, a={:?}, b={:?}, final={:?}",
+        root, child_a, child_b, final_task
+    );
 
     // Start and complete root.
     let mut guard = engine.start(root, WorkerId(1)).unwrap();

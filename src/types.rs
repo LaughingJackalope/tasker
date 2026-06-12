@@ -80,7 +80,9 @@ pub struct EngineStats {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TaskResult {
-    Ok { output_ref: u128 },
+    Ok {
+        output_ref: u128,
+    },
     Failed {
         error_code: u32,
         output_ref: Option<u128>,

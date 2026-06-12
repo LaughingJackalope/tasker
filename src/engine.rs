@@ -1,9 +1,9 @@
 use dashmap::DashMap;
 use rand::Rng;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, Notify};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use tokio::sync::{Notify, broadcast, mpsc};
 
 use crate::error::EngineError;
 use crate::types::*;
@@ -29,7 +29,8 @@ impl std::fmt::Debug for TaskGuard {
 impl TaskGuard {
     /// Mark the task as completed with the given result.
     pub fn complete(&mut self, result: TaskResult) {
-        self.engine.inner_complete(self.task_id, self.worker, result);
+        self.engine
+            .inner_complete(self.task_id, self.worker, result);
         self.done = true;
     }
 }
@@ -95,21 +96,41 @@ impl Counters {
 
     fn inc(&self, status: TaskStatus) {
         match status {
-            TaskStatus::Pending => { self.pending.fetch_add(1, Ordering::Relaxed); }
-            TaskStatus::Ready => { self.ready.fetch_add(1, Ordering::Relaxed); }
-            TaskStatus::Running { .. } => { self.running.fetch_add(1, Ordering::Relaxed); }
-            TaskStatus::Completed { .. } => { self.completed.fetch_add(1, Ordering::Relaxed); }
-            TaskStatus::Cancelled { .. } => { self.cancelled.fetch_add(1, Ordering::Relaxed); }
+            TaskStatus::Pending => {
+                self.pending.fetch_add(1, Ordering::Relaxed);
+            }
+            TaskStatus::Ready => {
+                self.ready.fetch_add(1, Ordering::Relaxed);
+            }
+            TaskStatus::Running { .. } => {
+                self.running.fetch_add(1, Ordering::Relaxed);
+            }
+            TaskStatus::Completed { .. } => {
+                self.completed.fetch_add(1, Ordering::Relaxed);
+            }
+            TaskStatus::Cancelled { .. } => {
+                self.cancelled.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
     fn dec(&self, status: TaskStatus) {
         match status {
-            TaskStatus::Pending => { self.pending.fetch_sub(1, Ordering::Relaxed); }
-            TaskStatus::Ready => { self.ready.fetch_sub(1, Ordering::Relaxed); }
-            TaskStatus::Running { .. } => { self.running.fetch_sub(1, Ordering::Relaxed); }
-            TaskStatus::Completed { .. } => { self.completed.fetch_sub(1, Ordering::Relaxed); }
-            TaskStatus::Cancelled { .. } => { self.cancelled.fetch_sub(1, Ordering::Relaxed); }
+            TaskStatus::Pending => {
+                self.pending.fetch_sub(1, Ordering::Relaxed);
+            }
+            TaskStatus::Ready => {
+                self.ready.fetch_sub(1, Ordering::Relaxed);
+            }
+            TaskStatus::Running { .. } => {
+                self.running.fetch_sub(1, Ordering::Relaxed);
+            }
+            TaskStatus::Completed { .. } => {
+                self.completed.fetch_sub(1, Ordering::Relaxed);
+            }
+            TaskStatus::Cancelled { .. } => {
+                self.cancelled.fetch_sub(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -137,7 +158,7 @@ pub struct TaskEngine {
 
     /// Ready queue channel.
     ready_tx: mpsc::Sender<TaskId>,
-    ready_rx: std::sync::Mutex<Option<mpsc::Receiver<TaskId>>>,
+    ready_rx: tokio::sync::Mutex<Option<mpsc::Receiver<TaskId>>>,
     /// Wakes the scheduler when new Ready tasks arrive.
     ready_notify: Arc<Notify>,
 
@@ -163,7 +184,7 @@ impl TaskEngine {
             blocking_pending: DashMap::new(),
             blocking_dependents: DashMap::new(),
             ready_tx,
-            ready_rx: std::sync::Mutex::new(Some(ready_rx)),
+            ready_rx: tokio::sync::Mutex::new(Some(ready_rx)),
             ready_notify: Arc::new(Notify::new()),
             status_tx,
             seq: AtomicU64::new(0),
@@ -185,12 +206,7 @@ impl TaskEngine {
     }
 
     /// Transition a task's status, update counters, broadcast.
-    fn transition(
-        &self,
-        id: TaskId,
-        from: TaskStatus,
-        to: TaskStatus,
-    ) {
+    fn transition(&self, id: TaskId, from: TaskStatus, to: TaskStatus) {
         self.counters.dec(from);
         self.counters.inc(to);
         let _ = self.status_tx.send((id, to, self.next_seq()));
@@ -206,7 +222,7 @@ impl TaskEngine {
             return Err(EngineError::EngineShuttingDown);
         }
 
-        let id = TaskId(rand::thread_rng().random::<u128>());
+        let id = TaskId(rand::rng().random::<u128>());
         let now = self.now_millis();
         let seq = self.next_seq();
 
@@ -253,7 +269,7 @@ impl TaskEngine {
             // Forward index: dep_id has us as a dependent.
             self.blocking_dependents
                 .entry(*dep_id)
-                .or_insert_with(HashSet::new)
+                .or_default()
                 .insert(id);
 
             // Insert edge for the blocking dep.
@@ -300,7 +316,7 @@ impl TaskEngine {
             );
             self.blocking_dependents
                 .entry(parent_id)
-                .or_insert_with(HashSet::new)
+                .or_default()
                 .insert(id);
         }
 
@@ -319,11 +335,7 @@ impl TaskEngine {
     }
 
     /// Status transition: Ready → Running. Atomically via entry API.
-    pub fn start(
-        self: &Arc<Self>,
-        id: TaskId,
-        worker: WorkerId,
-    ) -> Result<TaskGuard, EngineError> {
+    pub fn start(self: &Arc<Self>, id: TaskId, worker: WorkerId) -> Result<TaskGuard, EngineError> {
         if self.shutdown.load(Ordering::Relaxed) {
             return Err(EngineError::EngineShuttingDown);
         }
@@ -347,9 +359,10 @@ impl TaskEngine {
                     done: false,
                 })
             }
-            TaskStatus::Running { worker_id } => {
-                Err(EngineError::AlreadyRunning { id, worker: worker_id })
-            }
+            TaskStatus::Running { worker_id } => Err(EngineError::AlreadyRunning {
+                id,
+                worker: worker_id,
+            }),
             other => Err(EngineError::InvalidTransition {
                 id,
                 from: other,
@@ -359,12 +372,7 @@ impl TaskEngine {
     }
 
     /// Internal: transition a task to Completed and wake dependents.
-    pub(crate) fn inner_complete(
-        &self,
-        id: TaskId,
-        _worker: WorkerId,
-        result: TaskResult,
-    ) {
+    pub(crate) fn inner_complete(&self, id: TaskId, _worker: WorkerId, result: TaskResult) {
         let mut task = match self.tasks.get_mut(&id) {
             Some(t) => t,
             None => return,
@@ -460,14 +468,14 @@ impl TaskEngine {
             .collect();
 
         for child_id in children {
-            if let Some(child) = self.tasks.get(&child_id) {
-                if matches!(
+            if let Some(child) = self.tasks.get(&child_id)
+                && matches!(
                     child.status,
                     TaskStatus::Running { .. } | TaskStatus::Pending
-                ) {
-                    drop(child);
-                    let _ = self.cancel(child_id, reason);
-                }
+                )
+            {
+                drop(child);
+                let _ = self.cancel(child_id, reason);
             }
         }
 
@@ -549,10 +557,7 @@ impl TaskEngine {
         self.edges.insert((from, to), dep);
 
         // Update forward index.
-        self.blocking_dependents
-            .entry(from)
-            .or_insert_with(HashSet::new)
-            .insert(to);
+        self.blocking_dependents.entry(from).or_default().insert(to);
 
         // If Blocking and 'from' is not completed, update 'to' pending state.
         if matches!(kind, EdgeKind::Blocking) {
@@ -564,10 +569,7 @@ impl TaskEngine {
 
             if !from_completed {
                 // Add 'from' to 'to's pending set.
-                self.blocking_pending
-                    .entry(to)
-                    .or_insert_with(HashSet::new)
-                    .insert(from);
+                self.blocking_pending.entry(to).or_default().insert(from);
 
                 // Increment in_degree.
                 if let Some(mut task) = self.tasks.get_mut(&to) {
@@ -582,7 +584,9 @@ impl TaskEngine {
                         drop(task);
 
                         self.transition(to, old_status, TaskStatus::Pending);
-                        let _ = self.status_tx.send((to, TaskStatus::Pending, self.next_seq()));
+                        let _ = self
+                            .status_tx
+                            .send((to, TaskStatus::Pending, self.next_seq()));
                     }
                 }
             }
@@ -617,27 +621,25 @@ impl TaskEngine {
                 .map(|t| matches!(t.status, TaskStatus::Completed { .. }))
                 .unwrap_or(false);
 
-            if !from_completed {
-                if let Some(mut pending) = self.blocking_pending.get_mut(&to) {
-                    pending.remove(&from);
-                    if pending.is_empty() {
-                        drop(pending);
-                        self.blocking_pending.remove(&to);
+            if !from_completed && let Some(mut pending) = self.blocking_pending.get_mut(&to) {
+                pending.remove(&from);
+                if pending.is_empty() {
+                    drop(pending);
+                    self.blocking_pending.remove(&to);
 
-                        if let Some(mut task) = self.tasks.get_mut(&to) {
-                            if task.status == TaskStatus::Pending {
-                                let old_status = task.status;
-                                task.status = TaskStatus::Ready;
-                                task.updated_at = self.now_millis();
-                                task.edge_in_degree = 0;
-                                task.seq = self.next_seq();
-                                drop(task);
+                    if let Some(mut task) = self.tasks.get_mut(&to)
+                        && task.status == TaskStatus::Pending
+                    {
+                        let old_status = task.status;
+                        task.status = TaskStatus::Ready;
+                        task.updated_at = self.now_millis();
+                        task.edge_in_degree = 0;
+                        task.seq = self.next_seq();
+                        drop(task);
 
-                                self.transition(to, old_status, TaskStatus::Ready);
-                                let _ = self.ready_tx.try_send(to);
-                                self.ready_notify.notify_one();
-                            }
-                        }
+                        self.transition(to, old_status, TaskStatus::Ready);
+                        let _ = self.ready_tx.try_send(to);
+                        self.ready_notify.notify_one();
                     }
                 }
             }
@@ -660,7 +662,7 @@ impl TaskEngine {
     /// Block until a Ready task is available, then return it.
     /// Returns None if the engine is shut down.
     pub async fn recv_ready(self: &Arc<Self>) -> Option<TaskId> {
-        let mut rx = self.ready_rx.lock().unwrap();
+        let mut rx = self.ready_rx.lock().await;
         rx.as_mut()?.recv().await
     }
 
@@ -712,7 +714,7 @@ mod tests {
     use super::*;
 
     fn test_id() -> TaskId {
-        TaskId(rand::thread_rng().random::<u128>())
+        TaskId(rand::rng().random::<u128>())
     }
 
     fn make_spec(task_type: &str) -> TaskSpec {
@@ -777,7 +779,12 @@ mod tests {
         let id = engine.create(make_spec("test")).unwrap();
         let guard = engine.start(id, WorkerId(1)).unwrap();
         let task = engine.get_task(id).unwrap();
-        assert!(matches!(task.status, TaskStatus::Running { worker_id: WorkerId(1) }));
+        assert!(matches!(
+            task.status,
+            TaskStatus::Running {
+                worker_id: WorkerId(1)
+            }
+        ));
         drop(guard);
     }
 
@@ -867,7 +874,10 @@ mod tests {
         let _ = engine.cancel(parent, 42);
 
         let child_task = engine.get_task(child).unwrap();
-        assert!(matches!(child_task.status, TaskStatus::Cancelled { reason: 42 }));
+        assert!(matches!(
+            child_task.status,
+            TaskStatus::Cancelled { reason: 42 }
+        ));
     }
 
     #[test]
@@ -1028,7 +1038,9 @@ mod tests {
     fn test_depends_on_nonexistent_task() {
         let engine = TaskEngine::new();
         let a = engine.create(make_spec("a")).unwrap();
-        let err = engine.depends_on(a, test_id(), EdgeKind::Blocking).unwrap_err();
+        let err = engine
+            .depends_on(a, test_id(), EdgeKind::Blocking)
+            .unwrap_err();
         assert!(matches!(err, EngineError::NotFound(_)));
     }
 

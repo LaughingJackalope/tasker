@@ -1,5 +1,5 @@
-use criterion::{criterion_group, criterion_main, Criterion};
-use tasker::{TaskEngine, TaskResult, TaskSpec, WorkerId, Priority};
+use criterion::{Criterion, criterion_group, criterion_main};
+use tasker::{Priority, TaskEngine, TaskResult, TaskSpec, WorkerId};
 
 fn make_spec(task_type: &str) -> TaskSpec {
     TaskSpec {

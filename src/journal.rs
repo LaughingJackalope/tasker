@@ -13,14 +13,30 @@ const JOURNAL_VERSION: u8 = 1;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum JournalRecord {
-    TaskCreated { seq: u64, task: Task },
-    TaskStatusChanged { seq: u64, id: TaskId, from: TaskStatus, to: TaskStatus },
-    EdgeCreated { seq: u64, edge: Dependency },
-    EdgeRemoved { seq: u64, edge_id: EdgeId },
-    SnapshotTaken { seq: u64 },
+    TaskCreated {
+        seq: u64,
+        task: Task,
+    },
+    TaskStatusChanged {
+        seq: u64,
+        id: TaskId,
+        from: TaskStatus,
+        to: TaskStatus,
+    },
+    EdgeCreated {
+        seq: u64,
+        edge: Dependency,
+    },
+    EdgeRemoved {
+        seq: u64,
+        edge_id: EdgeId,
+    },
+    SnapshotTaken {
+        seq: u64,
+    },
 }
 
- /// Write-only journal that appends records to a segmented file.
+/// Write-only journal that appends records to a segmented file.
 pub struct JournalWriter {
     dir: PathBuf,
     current: BufWriter<File>,
@@ -56,9 +72,8 @@ impl JournalWriter {
     }
 
     pub fn append(&mut self, record: &JournalRecord) -> std::io::Result<()> {
-        let payload = rmp_serde::to_vec(record).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-        })?;
+        let payload = rmp_serde::to_vec(record)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let len = payload.len() as u32;
         let crc = crc32fast::hash(&payload);
 
@@ -80,7 +95,9 @@ impl JournalWriter {
     pub fn rotate(&mut self) -> std::io::Result<()> {
         self.current.flush()?;
         self.current_segment += 1;
-        let new_path = self.dir.join(format!("journal-{:06}.log", self.current_segment));
+        let new_path = self
+            .dir
+            .join(format!("journal-{:06}.log", self.current_segment));
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -150,7 +167,7 @@ pub fn read_journal(dir: &Path) -> std::io::Result<(Vec<JournalRecord>, u64)> {
         // Read and verify header.
         let mut magic = [0u8; 4];
         file.read_exact(&mut magic)?;
-        if &magic != &JOURNAL_MAGIC {
+        if magic != JOURNAL_MAGIC {
             continue; // Skip non-journal files.
         }
         let version = file.read_u8()?;
@@ -176,9 +193,8 @@ pub fn read_journal(dir: &Path) -> std::io::Result<(Vec<JournalRecord>, u64)> {
                 break;
             }
 
-            let record: JournalRecord = rmp_serde::from_slice(&payload).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-            })?;
+            let record: JournalRecord = rmp_serde::from_slice(&payload)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             match &record {
                 JournalRecord::TaskCreated { seq, .. } => max_seq = max_seq.max(*seq),
                 JournalRecord::TaskStatusChanged { seq, .. } => max_seq = max_seq.max(*seq),
@@ -199,12 +215,13 @@ pub fn purge_segments(dir: &Path, keep_after: u32) -> std::io::Result<()> {
     for entry in entries {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();
-        if let Some(stem) = name.strip_prefix("journal-").and_then(|s| s.strip_suffix(".log")) {
-            if let Ok(id) = stem.parse::<u32>() {
-                if id < keep_after {
-                    fs::remove_file(entry.path())?;
-                }
-            }
+        if let Some(stem) = name
+            .strip_prefix("journal-")
+            .and_then(|s| s.strip_suffix(".log"))
+            && let Ok(id) = stem.parse::<u32>()
+            && id < keep_after
+        {
+            fs::remove_file(entry.path())?;
         }
     }
     Ok(())

@@ -1,7 +1,7 @@
 use std::fmt;
 use std::path::Path;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 
 use bytes::BytesMut;
 use rmp_serde::{from_slice, to_vec};
@@ -17,12 +17,29 @@ use crate::types::*;
 /// Request enum — serialized over the wire as MessagePack.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub enum Request {
-    Create { spec: TaskSpec },
-    Start { id: TaskId, worker: WorkerId },
-    Complete { id: TaskId, result: TaskResult },
-    Cancel { id: TaskId, reason: u32 },
-    DependsOn { from: TaskId, to: TaskId, kind: EdgeKind },
-    RemoveDep { edge_id: EdgeId },
+    Create {
+        spec: TaskSpec,
+    },
+    Start {
+        id: TaskId,
+        worker: WorkerId,
+    },
+    Complete {
+        id: TaskId,
+        result: TaskResult,
+    },
+    Cancel {
+        id: TaskId,
+        reason: u32,
+    },
+    DependsOn {
+        from: TaskId,
+        to: TaskId,
+        kind: EdgeKind,
+    },
+    RemoveDep {
+        edge_id: EdgeId,
+    },
     Stats,
     Shutdown,
 }
@@ -123,7 +140,7 @@ async fn dispatch(engine: &Arc<TaskEngine>, frame: &Frame) -> Response {
                     kind: "DeserializeError".into(),
                     message: format!("deserialize error: {}", e),
                 },
-            }
+            };
         }
     };
 
@@ -137,23 +154,17 @@ async fn dispatch(engine: &Arc<TaskEngine>, frame: &Frame) -> Response {
             },
         },
         Request::Start { id, worker } => match engine.start(id, worker) {
-            Ok(_) => Response::Ok {
-                value: Value::Nil,
-            },
+            Ok(_) => Response::Ok { value: Value::Nil },
             Err(e) => Response::Err {
                 error: WireError::from(e),
             },
         },
         Request::Complete { id, result } => {
             engine.inner_complete(id, WorkerId(0), result);
-            Response::Ok {
-                value: Value::Nil,
-            }
+            Response::Ok { value: Value::Nil }
         }
         Request::Cancel { id, reason } => match engine.cancel(id, reason) {
-            Ok(()) => Response::Ok {
-                value: Value::Nil,
-            },
+            Ok(()) => Response::Ok { value: Value::Nil },
             Err(e) => Response::Err {
                 error: WireError::from(e),
             },
@@ -167,9 +178,7 @@ async fn dispatch(engine: &Arc<TaskEngine>, frame: &Frame) -> Response {
             },
         },
         Request::RemoveDep { edge_id } => match engine.remove_dep(edge_id) {
-            Ok(()) => Response::Ok {
-                value: Value::Nil,
-            },
+            Ok(()) => Response::Ok { value: Value::Nil },
             Err(e) => Response::Err {
                 error: WireError::from(e),
             },
@@ -187,9 +196,7 @@ async fn dispatch(engine: &Arc<TaskEngine>, frame: &Frame) -> Response {
             }
         }
         Request::Shutdown => match engine.shutdown().await {
-            Ok(()) => Response::Ok {
-                value: Value::Nil,
-            },
+            Ok(()) => Response::Ok { value: Value::Nil },
             Err(e) => Response::Err {
                 error: WireError::from(e),
             },
@@ -229,11 +236,11 @@ impl TaskClient {
         self.stream.flush().await?;
 
         loop {
-            if let Some(frame) = protocol::decode_frame(&mut self.buf)? {
-                if frame.stream_id == stream_id {
-                    let response: Response = from_slice(&frame.payload)?;
-                    return Ok(response);
-                }
+            if let Some(frame) = protocol::decode_frame(&mut self.buf)?
+                && frame.stream_id == stream_id
+            {
+                let response: Response = from_slice(&frame.payload)?;
+                return Ok(response);
             }
             let mut tmp = vec![0u8; 4096];
             let n = self.stream.read(&mut tmp).await?;

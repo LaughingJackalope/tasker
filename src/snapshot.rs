@@ -188,7 +188,7 @@ pub fn read_snapshot(path: &Path) -> std::io::Result<SnapshotData> {
     // Header.
     let mut magic = [0u8; 4];
     file.read_exact(&mut magic)?;
-    if &magic != &SNAPSHOT_MAGIC {
+    if magic != SNAPSHOT_MAGIC {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "invalid snapshot magic",
@@ -228,9 +228,8 @@ fn read_task(file: &mut File) -> std::io::Result<Task> {
     let len = file.read_u16::<LittleEndian>()? as usize;
     let mut type_buf = vec![0u8; len];
     file.read_exact(&mut type_buf)?;
-    let task_type = String::from_utf8(type_buf).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-    })?;
+    let task_type = String::from_utf8(type_buf)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
     // payload
     let len = file.read_u32::<LittleEndian>()? as usize;
@@ -289,7 +288,7 @@ fn read_task(file: &mut File) -> std::io::Result<Task> {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "unknown status tag",
-            ))
+            ));
         }
     };
 
@@ -322,9 +321,8 @@ fn read_task(file: &mut File) -> std::io::Result<Task> {
         let key_len = file.read_u16::<LittleEndian>()? as usize;
         let mut key_buf = vec![0u8; key_len];
         file.read_exact(&mut key_buf)?;
-        let key = String::from_utf8(key_buf).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-        })?;
+        let key = String::from_utf8(key_buf)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let val_len = file.read_u32::<LittleEndian>()? as usize;
         let mut val = vec![0u8; val_len];
         file.read_exact(&mut val)?;
@@ -377,7 +375,7 @@ fn read_edge(file: &mut File) -> std::io::Result<Dependency> {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "unknown edge kind tag",
-            ))
+            ));
         }
     };
 

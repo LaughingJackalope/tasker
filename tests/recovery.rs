@@ -307,7 +307,12 @@ fn test_journal_purge_segments() {
         .collect();
 
     for entry in &remaining {
-        let name = entry.as_ref().unwrap().file_name().to_string_lossy().to_string();
+        let name = entry
+            .as_ref()
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .to_string();
         let id: u32 = name
             .strip_prefix("journal-")
             .unwrap()

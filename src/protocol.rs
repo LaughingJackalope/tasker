@@ -117,7 +117,7 @@ pub fn decode_frame(buf: &mut BytesMut) -> Result<Option<Frame>, ProtocolError> 
     let mut frame = buf.split_to(total);
 
     // Verify magic.
-    if &frame[..4] != &MAGIC {
+    if frame[..4] != MAGIC {
         return Err(ProtocolError::InvalidMagic);
     }
 
@@ -131,8 +131,12 @@ pub fn decode_frame(buf: &mut BytesMut) -> Result<Option<Frame>, ProtocolError> 
     let stream_id = u16::from_le_bytes([frame[6], frame[7]]);
 
     // Verify CRC (last 4 bytes of frame).
-    let expected_crc =
-        u32::from_le_bytes([frame[total - 4], frame[total - 3], frame[total - 2], frame[total - 1]]);
+    let expected_crc = u32::from_le_bytes([
+        frame[total - 4],
+        frame[total - 3],
+        frame[total - 2],
+        frame[total - 1],
+    ]);
     let actual_crc = hash(&frame[..total - 4]);
     if expected_crc != actual_crc {
         return Err(ProtocolError::ChecksumMismatch);
